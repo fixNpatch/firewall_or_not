@@ -3,6 +3,12 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <stdio.h>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <string>
+// #include "killer.h"
+
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma warning( disable : 4996)
@@ -13,12 +19,84 @@
 
 /* Note: could also use malloc() and free() */
 
-int main()
-{
 
+std::string FormatAddress(DWORD ip)
+{
+	struct in_addr paddr;
+	paddr.S_un.S_addr = ip;
+
+	return inet_ntoa(paddr);
+}
+
+void KillAll(std::vector<MIB_TCPROW2> const& toKill)
+{
+	for (auto con : toKill) {
+
+		MIB_TCPROW row;
+		row.dwLocalAddr = con.dwLocalAddr;
+		row.dwLocalPort = con.dwLocalPort & 0xffff;
+		row.dwRemoteAddr = con.dwRemoteAddr;
+		row.dwRemotePort = con.dwRemotePort & 0xffff;
+		row.dwState = MIB_TCP_STATE_DELETE_TCB;
+
+		std::cout << "Killing " << FormatAddress(row.dwLocalAddr) << ":" << ntohs(static_cast<u_short>(row.dwLocalPort)) << " -> " << FormatAddress(row.dwRemoteAddr) << ":" << ntohs(static_cast<u_short>(row.dwRemotePort)) << std::endl;
+
+		DWORD result;
+		if ((result = SetTcpEntry(&row)) == 0)
+		{
+			std::cout << "Killed." << std::endl;
+		}
+		else
+		{
+			std::cout << "Windows reported that it failed to kill this connection, but may be lying. The result was " << result << "." << std::endl;
+		}
+	}
+}
+
+std::vector<MIB_TCPROW2> GetConnectionsFromProcess(int processIdToKill)
+{
+	auto tableMemory = std::vector<uint8_t>(1000000);
+	const auto table = reinterpret_cast<MIB_TCPTABLE2*>(&tableMemory[0]);
+	ULONG size = static_cast<ULONG>(tableMemory.size());
+	if (GetTcpTable2(table, &size, TRUE) != 0)
+	{
+		throw std::exception("Failed to get TCP table");
+	}
+
+	std::vector<MIB_TCPROW2> rows;
+	copy_if(&table->table[0], &table->table[table->dwNumEntries], back_inserter(rows), [processIdToKill](const MIB_TCPROW2 row) { return row.dwOwningPid == processIdToKill; });
+
+	return rows;
+}
+
+int kill(std::string PID)
+{
+	try {
+
+		auto const processIdToKill = stoi(PID);
+		auto const rows = GetConnectionsFromProcess(processIdToKill);
+		KillAll(rows);
+		std::cout << "Ensuring all connections were killed..." << std::endl;
+		auto const remainingRows = GetConnectionsFromProcess(processIdToKill);
+		if (!remainingRows.empty())
+		{
+			throw std::exception("Not all connections were killed.");
+		}
+		std::cout << "Done." << std::endl;
+		return 0;
+	}
+	catch (std::exception & ex)
+	{
+		std::cout << "Failed: " << ex.what() << std::endl;
+		return 1;
+	}
+}
+
+int show()
+{
 	// Declare and initialize variables
-	PMIB_TCPTABLE pTcpTable;
-	DWORD dwSize = 0;
+	PMIB_TCPTABLE2 pTcpTable;
+	DWORD ulSize = 0;
 	DWORD dwRetVal = 0;
 
 	char szLocalAddr[128];
@@ -28,33 +106,37 @@ int main()
 
 	int i;
 
-	pTcpTable = (MIB_TCPTABLE*)MALLOC(sizeof(MIB_TCPTABLE));
+	pTcpTable = (MIB_TCPTABLE2*)MALLOC(sizeof(MIB_TCPTABLE2));
 	if (pTcpTable == NULL) {
 		printf("Error allocating memory\n");
 		return 1;
 	}
 
-	dwSize = sizeof(MIB_TCPTABLE);
-	// Make an initial call to GetTcpTable to
-	// get the necessary size into the dwSize variable
-	if ((dwRetVal = GetTcpTable(pTcpTable, &dwSize, TRUE)) ==
+	ulSize = sizeof(MIB_TCPTABLE);
+	// Make an initial call to GetTcpTable2 to
+	// get the necessary size into the ulSize variable
+	if ((dwRetVal = GetTcpTable2(pTcpTable, &ulSize, TRUE)) ==
 		ERROR_INSUFFICIENT_BUFFER) {
 		FREE(pTcpTable);
-		pTcpTable = (MIB_TCPTABLE*)MALLOC(dwSize);
+		pTcpTable = (MIB_TCPTABLE2*)MALLOC(ulSize);
 		if (pTcpTable == NULL) {
 			printf("Error allocating memory\n");
 			return 1;
 		}
 	}
+
+
 	// Make a second call to GetTcpTable to get
 	// the actual data we require
-	if ((dwRetVal = GetTcpTable(pTcpTable, &dwSize, TRUE)) == NO_ERROR) {
+	if ((dwRetVal = GetTcpTable2(pTcpTable, &ulSize, TRUE)) == NO_ERROR) {
 		printf("\tNumber of entries: %d\n", (int)pTcpTable->dwNumEntries);
 		for (i = 0; i < (int)pTcpTable->dwNumEntries; i++) {
 			IpAddr.S_un.S_addr = (u_long)pTcpTable->table[i].dwLocalAddr;
 			strcpy_s(szLocalAddr, sizeof(szLocalAddr), inet_ntoa(IpAddr));
 			IpAddr.S_un.S_addr = (u_long)pTcpTable->table[i].dwRemoteAddr;
 			strcpy_s(szRemoteAddr, sizeof(szRemoteAddr), inet_ntoa(IpAddr));
+			DWORD PID = (u_long)pTcpTable->table[i].dwOwningPid;
+
 
 			printf("\n\tTCP[%d] State: %ld - ", i,
 				pTcpTable->table[i].dwState);
@@ -105,6 +187,7 @@ int main()
 			printf("\tTCP[%d] Remote Addr: %s\n", i, szRemoteAddr);
 			printf("\tTCP[%d] Remote Port: %d\n", i,
 				ntohs((u_short)pTcpTable->table[i].dwRemotePort));
+			printf("\tTCP[%d] ProcessId: %d\n", i, PID);
 		}
 	}
 	else {
@@ -116,6 +199,29 @@ int main()
 	if (pTcpTable != NULL) {
 		FREE(pTcpTable);
 		pTcpTable = NULL;
+	}
+
+	return 0;
+}
+
+
+int main()
+{
+
+	while(true)
+	{
+		std::string keyChain;
+		std::cout << ">>> ----------------------------------------------\nEnter ProcessID or type one of command:\n\n1. 'Exit' to stop program\n2. 'Show' to show TCP Table\n\n>>>";
+		std::cin >> keyChain;
+
+		if(keyChain == "Exit")
+		{
+			break;
+		} else if (keyChain == "Show")
+		{
+			show();
+		}
+		auto result = kill(keyChain);
 	}
 
 	return 0;
